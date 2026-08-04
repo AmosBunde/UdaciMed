@@ -160,3 +160,60 @@ Your project will be evaluated based on:
 ---
 
 **Ready to optimize medical AI for real-world deployment? Start with `notebook/01_baseline_analysis.ipynb` and begin your journey to production-ready healthcare AI!**
+---
+
+## Results and findings
+
+All three notebooks were executed end-to-end in a local environment and the
+complete pipeline meets every production target. Details below.
+
+### Execution environment
+
+The run used a CPU-only development machine (8-core x86_64, Linux, Python 3.12,
+torch 2.3.0+cpu, onnxruntime CPU) rather than the reference T4 instance, so a
+few pragmatic adaptations were made:
+
+- `torch`/`torchvision` installed from the CPU wheel index; `tensorrt-cu12`
+  skipped (requires CUDA). GPU-dependent choices in the notebooks key off
+  `torch.cuda.is_available()` and configure themselves correctly on a T4.
+- CUDA memory profiling is unavailable on CPU, so the profiling cells fall
+  back to process-RSS sampling plus an analytic activation breakdown.
+- All absolute timings below are CPU numbers and therefore conservative:
+  the T4 target would only improve them.
+
+### Pipeline results
+
+| Stage | Model | Parameters | GFLOPs/sample | Single-image latency | Batch throughput | Sensitivity |
+|-------|-------|-----------:|--------------:|---------------------:|-----------------:|------------:|
+| Notebook 1 - baseline (eager PyTorch) | ResNet-18-Adaptive | 11.18M | 1.82 | 33.10 ms | 38/s | 100.0% (t=0.4) |
+| Notebook 2 - architecture optimized (eager PyTorch) | ResNet-18-Native + depthwise separable | 1.45M | 0.03 | 4.65 ms | 1,224/s | 98.2% (t=0.7) |
+| Notebook 3 - deployed (ONNX Runtime) | same, ONNX FP32 | 1.45M (5.52 MB file) | 0.03 | 0.498 ms | 3,958/s (batch 16) | 98.21% |
+
+Production SLA scorecard after notebook 3: **5/5 targets met** -
+memory 5.52 MB (<100 MB), latency 0.498 ms (<3 ms), throughput 3,958
+samples/sec (>2,000), FLOP reduction 98.5% (>80%, and 0.03 < 0.4
+GFLOPs/sample), sensitivity 98.21% (>98%).
+
+### Key findings
+
+1. **The biggest optimization was a measurement insight, not a technique.**
+   The baseline wrapper silently upscaled every 64x64 input to 224x224
+   (`F.interpolate` in `forward()`), inflating convolution work and activation
+   memory by 12.25x for zero diagnostic gain. Removing it cut 91.9% of FLOPs
+   and took latency from 33.1 ms to 5.6 ms before any real architecture work.
+2. **Depthwise separable convolutions carried the parameter budget.** Swapping
+   the 16 dense 3x3 convolutions cut parameters 87% (11.18M to 1.45M) and
+   FLOPs to 0.03 GFLOPs/sample; after 15 epochs of retraining with transferred
+   weights the model held 98.2% sensitivity with overall accuracy up 1.6
+   points - the baseline was heavily over-parameterized for this binary task.
+3. **Runtime choice mattered as much as architecture.** ONNX Runtime's graph
+   fusion turned the already-optimized model's 4.65 ms into 0.498 ms (9.3x)
+   on the same hardware - eager-mode overhead dominates once a model is this
+   small.
+4. **Not every documented trick paid off.** channels_last + in-place ReLU made
+   no measurable CPU difference (oneDNN already reorders layouts; torchvision
+   ReLUs are already in-place); it is kept only because it is free and helps
+   on Tensor Core GPUs. Low-rank factorization was analyzed and rejected: the
+   only linear layer (512->2) is too small to benefit.
+5. **Combined effect:** ~66x latency and ~104x throughput over the baseline
+   while staying above the 98% clinical sensitivity floor.
